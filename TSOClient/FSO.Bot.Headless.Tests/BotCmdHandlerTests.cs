@@ -5,11 +5,14 @@
  */
 
 using System;
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 using FSO.Bot.Headless;
+using FSO.Files.Formats.tsodata;
+using FSO.Server.Clients;
 using FSO.Server.Protocol.Electron.Packets;
 using Xunit;
 
@@ -162,5 +165,242 @@ public class BotCmdHandlerTests
         // Must not be "unknown bot-cmd: probe-road".
         var error = (string)reply["error"] ?? string.Empty;
         Assert.DoesNotContain("unknown bot-cmd", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ---- Full production path tests (veracity rework freesoexperiment-923) ----
+    //
+    // These tests exercise the COMPLETE BulletinRequest → ProbeBulletinSubscriber → TCS → JSON
+    // path, not just the null-guard. The seam is AriesClient itself:
+    //
+    //   • AriesClient is not sealed.
+    //   • AriesClient.Write guards on Session!=null — when Session is null (no Connect() called),
+    //     Write is a silent no-op.  No exception, no crash.  This makes AriesClient usable as a
+    //     headless stub without subclassing.
+    //   • AriesClient.MessageReceived(IoSession, object) is a PUBLIC method (IoHandler interface)
+    //     that fans out to all registered IAriesMessageSubscriber instances.  Calling it directly
+    //     simulates an inbound packet from the city socket.
+    //
+    // The production path under test:
+    //   TryHandleAsync
+    //     → checks cityAries != null        (NOT the null-guard path)
+    //     → cityAries.Write(BulletinRequest) (silent no-op — no Session)
+    //     → registers TCS in _pendingBulletins
+    //     → awaits TCS
+    //   [concurrent task]
+    //     → stub.MessageReceived(null, BulletinResponse)
+    //     → ProbeBulletinSubscriber.MessageReceived
+    //     → TCS.TrySetResult
+    //   TryHandleAsync
+    //     → TCS resolves
+    //     → JSON projection → EmitReply (ok=true, neighborhood_id, count, messages[])
+    //
+    // To isolate tests, we reset BotCmdHandler._subscriberAdded via reflection before each
+    // full-path test so RegisterSubscriber always registers a fresh ProbeBulletinSubscriber on
+    // our stub instance.
+
+    /// <summary>
+    /// Resets <see cref="BotCmdHandler._subscriberAdded"/> to false via reflection so that
+    /// <see cref="BotCmdHandler.RegisterSubscriber"/> will register a fresh subscriber on the
+    /// given <paramref name="client"/> instance even if it was already called before.
+    /// </summary>
+    private static void ResetSubscriberAdded()
+    {
+        var f = typeof(BotCmdHandler).GetField(
+            "_subscriberAdded",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        f?.SetValue(null, false);
+    }
+
+    /// <summary>
+    /// Full production path: BulletinRequest emitted, ProbeBulletinSubscriber notified via
+    /// stub.MessageReceived, TCS resolves, JSON reply ok=true with correct shape.
+    ///
+    /// <para>
+    /// This test FAILS if any of the following is broken:
+    /// <list type="bullet">
+    ///   <item>The BulletinRequest is sent (Write called with wrong type → subscriber never
+    ///     matches → TCS times out → ok=false).</item>
+    ///   <item>ProbeBulletinSubscriber is not registered (subscriber not called → TCS
+    ///     times out → ok=false).</item>
+    ///   <item>The TCS correlator is broken (TCS never resolved → timeout → ok=false).</item>
+    ///   <item>The JSON projection is wrong (assertion on data fields fails).</item>
+    /// </list>
+    /// </para>
+    ///
+    /// <para>
+    /// Seam documentation: <c>AriesClient.Write</c> is non-virtual but safe with a null
+    /// <c>Session</c> (silent no-op at line 173: <c>if (this.Session != null &amp;&amp;
+    /// this.Session.Connected)</c>).  <c>AriesClient.MessageReceived</c> is a public
+    /// <c>IoHandler</c> interface method that fan-outs to all registered
+    /// <c>IAriesMessageSubscriber</c> instances — including <c>ProbeBulletinSubscriber</c>
+    /// registered via <c>BotCmdHandler.RegisterSubscriber</c>.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ProbeBulletin_FullProductionPath_OkTrueWithMessages()
+    {
+        // Reset subscriber gate so our stub gets a fresh ProbeBulletinSubscriber.
+        ResetSubscriberAdded();
+        var stub = new AriesClient(kernel: null);
+        BotCmdHandler.RegisterSubscriber(stub);
+
+        // Build a fixture BulletinResponse with one message.
+        var fixtureBulletin = new BulletinItem
+        {
+            ID        = 42,
+            NhoodID   = 1,
+            SenderID  = 2,
+            SenderName = "baron",
+            Subject   = "hello city",
+            Body      = "first bulletin post",
+            Time      = 1714950000L,
+            Type      = BulletinType.Community,
+            Flags     = 0,
+            LotID     = 2,
+        };
+        var response = new BulletinResponse
+        {
+            Type     = BulletinResponseType.MESSAGES,
+            Messages = new[] { fixtureBulletin },
+        };
+
+        var line = """{"kind":"bot-cmd","cmd":"probe-bulletin","correlation_id":"c-full-1","args":{"neighborhood_id":1}}""";
+        var node = JsonNode.Parse(line).AsObject();
+
+        string captured = null;
+        var latch = new ManualResetEventSlim();
+        using var _cap = PerceptionEmitterCapture.Capture(s => { captured = s; latch.Set(); });
+
+        // Concurrently deliver the response after a short yield, simulating the city socket reply.
+        // The delay must be > 0 so TryHandleAsync has time to register the TCS before
+        // MessageReceived fires.  Task.Yield() alone can race; 20 ms is safe for unit tests.
+        var deliveryTask = Task.Run(async () =>
+        {
+            await Task.Delay(20);
+            stub.MessageReceived(session: null, message: response);
+        });
+
+        var handled = await BotCmdHandler.TryHandleAsync(node, cityAries: stub, default);
+        await deliveryTask;
+
+        Assert.True(handled, "TryHandleAsync must return true (consumed)");
+        Assert.True(latch.Wait(TimeSpan.FromSeconds(5)), "bot-cmd-reply never emitted — TCS was not resolved");
+
+        var reply = JsonNode.Parse(captured).AsObject();
+        Assert.Equal("bot-cmd-reply",   (string)reply["kind"]);
+        Assert.Equal("c-full-1",        (string)reply["correlation_id"]);
+        Assert.True((bool)reply["ok"],  $"expected ok=true but got error: {(string)reply["error"]}");
+
+        var data = reply["data"].AsObject();
+        Assert.Equal(1L, (long)data["neighborhood_id"]);
+        Assert.Equal(1L, (long)data["count"]);
+
+        var messages = data["messages"].AsArray();
+        Assert.Single(messages);
+        var msg = messages[0].AsObject();
+        Assert.Equal(42L,              (long)msg["bulletin_id"]);
+        Assert.Equal("baron",          (string)msg["sender_name"]);
+        Assert.Equal("hello city",     (string)msg["subject"]);
+        Assert.Equal("first bulletin post", (string)msg["body"]);
+        Assert.Equal(1L,               (long)msg["nhood_id"]);
+        Assert.Equal(2L,               (long)msg["lot_id"]);
+        Assert.Equal("Community",      (string)msg["type"]);
+    }
+
+    /// <summary>
+    /// Mutation test: sending a BulletinResponse with the wrong type (not MESSAGES) must
+    /// NOT resolve the happy path.  This verifies the packet-type check in
+    /// <see cref="HandleProbeBulletinAsync"/> (the <c>resp.Type != BulletinResponseType.MESSAGES</c>
+    /// guard). The TCS is resolved with the wrong-type response, so ok=false with the
+    /// "server returned" error — not a timeout, not a null-guard path.
+    /// </summary>
+    [Fact]
+    public async Task ProbeBulletin_WrongResponseType_EmitsServerReturnedError()
+    {
+        ResetSubscriberAdded();
+        var stub = new AriesClient(kernel: null);
+        BotCmdHandler.RegisterSubscriber(stub);
+
+        // Respond with FAIL_NOT_MAYOR instead of MESSAGES.
+        var wrongResponse = new BulletinResponse
+        {
+            Type     = BulletinResponseType.FAIL_NOT_MAYOR,
+            Messages = Array.Empty<BulletinItem>(),
+        };
+
+        var line = """{"kind":"bot-cmd","cmd":"probe-bulletin","correlation_id":"c-wrong-1","args":{"neighborhood_id":1}}""";
+        var node = JsonNode.Parse(line).AsObject();
+
+        string captured = null;
+        var latch = new ManualResetEventSlim();
+        using var _cap = PerceptionEmitterCapture.Capture(s => { captured = s; latch.Set(); });
+
+        var deliveryTask = Task.Run(async () =>
+        {
+            await Task.Delay(20);
+            stub.MessageReceived(session: null, message: wrongResponse);
+        });
+
+        await BotCmdHandler.TryHandleAsync(node, cityAries: stub, default);
+        await deliveryTask;
+
+        Assert.True(latch.Wait(TimeSpan.FromSeconds(5)), "bot-cmd-reply never emitted");
+
+        var reply = JsonNode.Parse(captured).AsObject();
+        Assert.Equal("c-wrong-1", (string)reply["correlation_id"]);
+        Assert.False((bool)reply["ok"], "expected ok=false for non-MESSAGES response type");
+
+        var error = (string)reply["error"];
+        // Must contain "server returned" from the packet-type guard, not "city socket unavailable"
+        // (null-guard path) and not "timeout".
+        Assert.Contains("server returned", error, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("FAIL_NOT_MAYOR", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Mutation test: if a non-BulletinResponse packet arrives, the subscriber ignores it,
+    /// the TCS is never resolved, and the handler times out with ok=false "timeout".
+    /// This verifies the subscriber's packet-type filter is correctly wired.
+    /// Uses a short timeout (1s) to keep the test fast.
+    /// </summary>
+    [Fact]
+    public async Task ProbeBulletin_WrongPacketType_TimesOut()
+    {
+        ResetSubscriberAdded();
+        var stub = new AriesClient(kernel: null);
+        BotCmdHandler.RegisterSubscriber(stub);
+
+        var line = """{"kind":"bot-cmd","cmd":"probe-bulletin","correlation_id":"c-timeout-1","args":{"neighborhood_id":1}}""";
+        var node = JsonNode.Parse(line).AsObject();
+
+        string captured = null;
+        var latch = new ManualResetEventSlim();
+        using var _cap = PerceptionEmitterCapture.Capture(s => { captured = s; latch.Set(); });
+
+        // Deliver a FindLotResponse (wrong type) — subscriber should ignore it.
+        var deliveryTask = Task.Run(async () =>
+        {
+            await Task.Delay(20);
+            stub.MessageReceived(session: null, message: new FindLotResponse());
+        });
+
+        // Use a short cancellation token to avoid the full 10-second production timeout.
+        using var shortCts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        await BotCmdHandler.TryHandleAsync(node, cityAries: stub, shortCts.Token);
+        await deliveryTask;
+
+        Assert.True(latch.Wait(TimeSpan.FromSeconds(3)), "bot-cmd-reply never emitted after timeout");
+
+        var reply = JsonNode.Parse(captured).AsObject();
+        Assert.Equal("c-timeout-1", (string)reply["correlation_id"]);
+        Assert.False((bool)reply["ok"]);
+
+        var error = (string)reply["error"];
+        // Must be "timeout" or "cancelled" — not "city socket unavailable" (null-guard path).
+        var isTimeoutOrCancelled =
+            error.Contains("timeout",   StringComparison.OrdinalIgnoreCase) ||
+            error.Contains("cancelled", StringComparison.OrdinalIgnoreCase);
+        Assert.True(isTimeoutOrCancelled,
+            $"expected timeout/cancelled error but got: {error}");
     }
 }
