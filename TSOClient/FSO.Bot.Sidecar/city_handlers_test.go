@@ -73,7 +73,8 @@ func TestCityForwardingHandlersDispatchIPC(t *testing.T) {
 		},
 		{
 			// vote uses voteHandler (name-primary). Exercising the target_persist_id
-			// fallback path here. Election cycle id must not be forwarded — it is
+			// fallback path here (no target_avatar_name — that path is covered by
+			// TestVoteNameResolution). Election cycle id must not be forwarded — it is
 			// server-managed (election_cycle_id DB column); supplying it would let the
 			// caller target an old/closed cycle.
 			op: "vote",
@@ -82,30 +83,30 @@ func TestCityForwardingHandlersDispatchIPC(t *testing.T) {
 				"neighborhood_id":   float64(12),
 				"election_cycle_id": float64(7),
 				"voter_persist_id":  float64(999), // caller is the voter (bot knows from session)
-				"target_avatar_name": "Alice",     // present but should NOT be forwarded to IPC
 			},
 			wantForward: map[string]any{
 				// After JSON marshal+unmarshal in captureOneCommand, int64 becomes float64.
 				"target_persist_id": float64(42),
 				"neighborhood_id":   float64(12),
 			},
-			wantDropped: []string{"election_cycle_id", "voter_persist_id", "target_avatar_name"},
+			wantDropped: []string{"election_cycle_id", "voter_persist_id"},
 		},
 		{
 			// nominate uses nominateHandler (name-primary). Same rationale as vote.
+			// target_avatar_name absent: testing the persist_id fallback path only.
+			// Name-primary path is covered by TestNominateNameResolution.
 			op: "nominate",
 			inArgs: map[string]any{
 				"target_persist_id": float64(42),
 				"neighborhood_id":   float64(12),
 				"election_cycle_id": float64(7),
-				"target_avatar_name": "Alice",     // present but should NOT be forwarded to IPC
 			},
 			wantForward: map[string]any{
 				// After JSON marshal+unmarshal in captureOneCommand, int64 becomes float64.
 				"target_persist_id": float64(42),
 				"neighborhood_id":   float64(12),
 			},
-			wantDropped: []string{"election_cycle_id", "target_avatar_name"},
+			wantDropped: []string{"election_cycle_id"},
 		},
 		{
 			op:      "view-neighborhood",
@@ -134,48 +135,17 @@ func TestCityForwardingHandlersDispatchIPC(t *testing.T) {
 				"payload": map[string]any{"queued": true, "verb": tc.op},
 			})
 
-			// vote/nominate: use the real name-primary handlers with a nil store
-			// (target_persist_id fallback path). target_avatar_name in the input
-			// args is ignored when the name store is nil (lookupName returns nil for
-			// nil store — the handler falls through to target_persist_id).
-			// NOTE: nil store path — lookupName is called with nil store but the
-			// name "Alice" in inArgs triggers the name path; to exercise the pure
-			// fallback we'd need an unbound name. Instead we exercise the name path
-			// separately (TestVoteNameResolution). For this test suite we omit
-			// target_avatar_name from vote/nominate inArgs when using a nil store so
-			// we test only the persist_id path through the real handler.
+			// vote/nominate: use the real name-primary handlers with a fresh store
+			// (target_persist_id fallback path). The table rows for vote/nominate
+			// already omit target_avatar_name so we exercise the persist_id path
+			// directly. The name-primary path is covered by TestVoteNameResolution /
+			// TestNominateNameResolution.
 			var handler convention.HandlerFunc
 			switch tc.op {
 			case "vote":
 				handler = voteHandler(ipc, NewMemoryStore())
-				// Replace inArgs for this case: omit target_avatar_name so we take
-				// the persist_id path (name "Alice" is not bound in the fresh store,
-				// which would return an error rather than forwarding).
-				tc.inArgs = map[string]any{
-					"target_persist_id": float64(42),
-					"neighborhood_id":   float64(12),
-					"election_cycle_id": float64(7),
-					"voter_persist_id":  float64(999),
-				}
-				tc.wantForward = map[string]any{
-					// After JSON marshal+unmarshal in captureOneCommand, int64 becomes float64.
-				"target_persist_id": float64(42),
-					"neighborhood_id":   float64(12),
-				}
-				tc.wantDropped = []string{"election_cycle_id", "voter_persist_id"}
 			case "nominate":
 				handler = nominateHandler(ipc, NewMemoryStore())
-				tc.inArgs = map[string]any{
-					"target_persist_id": float64(42),
-					"neighborhood_id":   float64(12),
-					"election_cycle_id": float64(7),
-				}
-				tc.wantForward = map[string]any{
-					// After JSON marshal+unmarshal in captureOneCommand, int64 becomes float64.
-				"target_persist_id": float64(42),
-					"neighborhood_id":   float64(12),
-				}
-				tc.wantDropped = []string{"election_cycle_id"}
 			default:
 				handler = simpleForwardingHandler(ipc, tc.op, tc.allowed...)
 			}
@@ -291,6 +261,14 @@ func TestVoteNameResolution(t *testing.T) {
 		// After JSON marshal+unmarshal, numbers become float64.
 		if got := cmd.Args["target_persist_id"]; got != float64(77) {
 			t.Errorf("target_persist_id: want float64(77) (name wins) got %v (%T)", got, got)
+		}
+		// target_avatar_name must NOT leak into the forwarded IPC args, even when
+		// it was present in the inArgs. A regression that forwards it would expose
+		// the name store key to the C# bot, which has no use for it and would forward
+		// it to the NhoodRequest wire where the server ignores unknown fields but the
+		// contract is violated.
+		if _, bad := cmd.Args["target_avatar_name"]; bad {
+			t.Errorf("target_avatar_name must not be forwarded to bot when overriding target_persist_id: %v", cmd.Args)
 		}
 	})
 
@@ -526,12 +504,27 @@ func TestCityDeclarationsPresent(t *testing.T) {
 		// dotpath updates) — valuable context without PEC framing. Out of scope for
 		// freesoexperiment-7e7 (unit tests) to re-audit declaration prose style.
 		seen := map[string]bool{}
-		for _, a := range d.Args {
+		argByName := map[string]*convention.ArgDescriptor{}
+		for i, a := range d.Args {
 			seen[a.Name] = true
+			argByName[a.Name] = &d.Args[i]
 		}
 		for _, need := range w.required {
 			if !seen[need] {
 				t.Errorf("%s: declaration missing required arg %q", w.op, need)
+			}
+		}
+		// freesoexperiment-17f: target_persist_id is the hex/decimal fallback arg;
+		// required must be false because the caller may use target_avatar_name
+		// instead (name-primary I0-5). required:true would reject callers that omit
+		// target_persist_id and supply target_avatar_name only — exactly the preferred
+		// call shape.
+		if w.op == "vote" || w.op == "nominate" {
+			arg, ok := argByName["target_persist_id"]
+			if !ok {
+				t.Errorf("%s: target_persist_id arg missing (already checked above)", w.op)
+			} else if arg.Required {
+				t.Errorf("%s: target_persist_id must have required:false (callers may use target_avatar_name instead), got required:true", w.op)
 			}
 		}
 	}
