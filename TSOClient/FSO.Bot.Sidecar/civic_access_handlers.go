@@ -284,3 +284,25 @@ func HasCommunityAccess(lotID uint32, personaName string) bool {
 	}
 	return false
 }
+
+// IsCommunityGated returns true if the given lot_id has any grants registered
+// in community-access.json. A lot is "community-gated" once a mayor has issued
+// at least one grant-community-access for it — even if that grant covers only
+// specific personas or the wildcard "*". The visit-lot handler calls this to
+// decide whether to enforce the HasCommunityAccess check; lots without any
+// grants are ordinary residential lots and pass through unconditionally.
+func IsCommunityGated(lotID uint32) bool {
+	communityAccessMu.Lock()
+	defer communityAccessMu.Unlock()
+
+	grants, err := readCommunityAccess()
+	if err != nil {
+		return false
+	}
+	for _, g := range grants {
+		if g.LotID == lotID {
+			return true
+		}
+	}
+	return false
+}
