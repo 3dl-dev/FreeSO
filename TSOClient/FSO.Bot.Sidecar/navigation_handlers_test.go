@@ -102,6 +102,7 @@ func TestVisitLotHandlerHexFallback(t *testing.T) {
 	tmp := t.TempDir()
 	withFSO_USER(t, "visit-lot-test-hex")
 	withConfigHome(t, tmp)
+	withSharedDataHome(t, tmp)
 
 	fake := newFakeBotProcess()
 	ipc := NewIPC(fake.bot)
@@ -196,6 +197,7 @@ func TestVisitLotHandlerMyNameShape(t *testing.T) {
 	tmp := t.TempDir()
 	withFSO_USER(t, "visit-lot-test-name")
 	withConfigHome(t, tmp)
+	withSharedDataHome(t, tmp)
 
 	fake := newFakeBotProcess()
 	ipc := NewIPC(fake.bot)
@@ -424,6 +426,7 @@ func TestVisitLotHandlerWriteNextLotBeforeExit(t *testing.T) {
 	tmp := t.TempDir()
 	withFSO_USER(t, "visit-lot-ordering-test")
 	withConfigHome(t, tmp)
+	withSharedDataHome(t, tmp)
 
 	fake := newFakeBotProcess()
 	ipc := NewIPC(fake.bot)
@@ -553,6 +556,7 @@ func TestVisitLotHandlerCommunityAccessBlocked(t *testing.T) {
 	tmp := t.TempDir()
 	withFSO_USER(t, "ellis") // caller is Ellis, who has no grant
 	withConfigHome(t, tmp)
+	withSharedDataHome(t, tmp)
 
 	// Grant access to lot 17 for "botrous" only (not "ellis").
 	// Use FSO_MAYOR_NHOOD to authorise the grant handler.
@@ -643,6 +647,7 @@ func TestVisitLotHandlerCommunityAccessGranted(t *testing.T) {
 	tmp := t.TempDir()
 	withFSO_USER(t, "botrous") // Botrous has a grant for lot 17
 	withConfigHome(t, tmp)
+	withSharedDataHome(t, tmp)
 
 	// Grant botrous access to lot 17.
 	os.Setenv("FSO_MAYOR_NHOOD", "1")
@@ -735,6 +740,7 @@ func TestVisitLotHandlerNonCommunityLotPassesThrough(t *testing.T) {
 	tmp := t.TempDir()
 	withFSO_USER(t, "marlo") // persona with no grant
 	withConfigHome(t, tmp)
+	withSharedDataHome(t, tmp)
 
 	// Grant community access for lot 17 (but we'll be visiting lot 99 = non-community).
 	os.Setenv("FSO_MAYOR_NHOOD", "1")
