@@ -304,6 +304,16 @@ func main() {
 		}
 		log.Printf("convention handlers: %d tax-family ops serving", taxServers)
 
+		// Dialog family (freesoexperiment-849): respond-to-dialog.
+		// Sends VMNetDialogResponseCmd to unblock a Sim waiting on a modal dialog
+		// (e.g. Restock Fridge budget entry). Agent reads dialog_id from perception
+		// recent_events[] kind=='dialog' and calls this op to answer.
+		dialogServers, err := RegisterDialogHandlers(ctx, cf, ipc)
+		if err != nil {
+			log.Fatalf("register dialog handlers: %v", err)
+		}
+		log.Printf("convention handlers: %d dialog-family ops serving", dialogServers)
+
 		// Single-dispatcher: one Subscribe goroutine handles every registered op
 		// instead of one Subscribe per op. Replaces the convention.Server fleet
 		// (which saturated SQLite at 103 × 500ms polls + per-poll fs sync) with
