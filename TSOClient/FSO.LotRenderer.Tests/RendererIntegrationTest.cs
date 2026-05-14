@@ -2,7 +2,7 @@
 //
 // Requirements:
 //   FSO server up at FSO_RENDERER_API_URL (default http://workshop:9000)
-//   Game assets at FSO_GAME_LOCATION (default /home/baron/projects/freeso-experiment/GameAssets/)
+//   Game assets at FSO_GAME_LOCATION (default /home/baron/projects/freeso-experiment/GameAssets/TSOClient/)
 //   SDL_VIDEODRIVER=offscreen (or Xvfb display)
 //
 // Run with:
@@ -34,7 +34,7 @@ namespace FSO.LotRenderer.Tests
             var user     = Environment.GetEnvironmentVariable("FSO_RENDERER_USER")      ?? "baron";
             var password = Environment.GetEnvironmentVariable("FSO_RENDERER_PASS")      ?? "test1234";
             var gamePath = Environment.GetEnvironmentVariable("FSO_GAME_LOCATION")
-                           ?? "/home/baron/projects/freeso-experiment/GameAssets/";
+                           ?? "/home/baron/projects/freeso-experiment/GameAssets/TSOClient/";
 
             // Locate the renderer binary (built alongside the test).
             var rendererBin = FindRendererBinary();
@@ -107,9 +107,12 @@ namespace FSO.LotRenderer.Tests
             var apiUrl   = Environment.GetEnvironmentVariable("FSO_RENDERER_API_URL")   ?? "http://workshop:9000";
             var user     = Environment.GetEnvironmentVariable("FSO_RENDERER_USER")      ?? "baron";
             var password = Environment.GetEnvironmentVariable("FSO_RENDERER_PASS")      ?? "test1234";
-            // Deliberately omit trailing slash to test normalization.
-            var gamePathNoTrail = Environment.GetEnvironmentVariable("FSO_GAME_LOCATION")
-                           ?? "/home/baron/projects/freeso-experiment/GameAssets";
+            // Deliberately omit trailing slash to test normalization (freesoexperiment-944).
+            // Strip any trailing separator from FSO_GAME_LOCATION so the regression case is
+            // exercised regardless of how the env var is set.
+            var gamePathNoTrail = (Environment.GetEnvironmentVariable("FSO_GAME_LOCATION")
+                           ?? "/home/baron/projects/freeso-experiment/GameAssets/TSOClient/")
+                           .TrimEnd('/');
 
             var rendererBin = FindRendererBinary();
             Assert.True(File.Exists(rendererBin),
@@ -180,7 +183,7 @@ namespace FSO.LotRenderer.Tests
             var user     = Environment.GetEnvironmentVariable("FSO_RENDERER_USER")      ?? "baron";
             var password = Environment.GetEnvironmentVariable("FSO_RENDERER_PASS")      ?? "test1234";
             var gamePath = Environment.GetEnvironmentVariable("FSO_GAME_LOCATION")
-                           ?? "/home/baron/projects/freeso-experiment/GameAssets/";
+                           ?? "/home/baron/projects/freeso-experiment/GameAssets/TSOClient/";
 
             var rendererBin = FindRendererBinary();
             Assert.True(File.Exists(rendererBin),
@@ -345,7 +348,7 @@ namespace FSO.LotRenderer.Tests
             var user     = Environment.GetEnvironmentVariable("FSO_RENDERER_USER")      ?? "baron";
             var password = Environment.GetEnvironmentVariable("FSO_RENDERER_PASS")      ?? "test1234";
             var gamePath = Environment.GetEnvironmentVariable("FSO_GAME_LOCATION")
-                           ?? "/home/baron/projects/freeso-experiment/GameAssets/";
+                           ?? "/home/baron/projects/freeso-experiment/GameAssets/TSOClient/";
 
             // Combination matrix — see doc comment.
             var combos = new (int Level, string Angle, string Zoom)[]
