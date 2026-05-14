@@ -206,15 +206,13 @@ func TestJournalWriterWriteSyncAfterSIGKILL(t *testing.T) {
 	deadline := 10 // seconds
 	var found bool
 	for i := 0; i < deadline*10; i++ {
-		// Sleep 100ms per iteration.
+		// Sleep 100ms per iteration — polls within 10s total.
 		entries, _ := os.ReadDir(journalDir)
 		if len(entries) > 0 {
 			found = true
 			break
 		}
-		// Use select with a timer channel to avoid importing "time" for just a sleep.
-		// Actually, we need time.Sleep — it is imported in journal_writer.go already
-		// but this is the test file. Use exec.Command("sleep").
+		// Use exec.Command("sleep") to avoid importing "time" in this file.
 		sleepCmd := exec.Command("sleep", "0.1")
 		_ = sleepCmd.Run()
 	}
@@ -222,7 +220,7 @@ func TestJournalWriterWriteSyncAfterSIGKILL(t *testing.T) {
 	if !found {
 		cmd.Process.Kill() //nolint:errcheck
 		cmd.Wait()         //nolint:errcheck
-		t.Fatal("journal file did not appear within 1s of subprocess start — write may not have happened before block")
+		t.Fatal("journal file did not appear within 10s of subprocess start — write may not have happened before block")
 	}
 
 	// NOW kill the subprocess with SIGKILL (no cleanup hooks, no defer).
