@@ -64,6 +64,7 @@ func main() {
 	noBot := flag.Bool("no-bot", false, "skip launching the bot (campfire-only mode for testing)")
 	description := flag.String("description", "freeso.lot", "campfire description")
 	engineerPubkey := flag.String("engineer-pubkey", "", "hex pubkey to auto-admit as member at body-cf creation time (overrides FREESO_ENGINEER_PUBKEY)")
+	islandNamespaceCF := flag.String("island-namespace-cf", "", "automata-island naming namespace cf id (overrides ISLAND_NAMESPACE_CF); enables lot-name registration on purchase")
 	flag.Parse()
 
 	log.SetOutput(os.Stderr)
@@ -80,6 +81,14 @@ func main() {
 	// If unset, the loop is a no-op — existing flows are not affected.
 	if *engineerPubkey == "" {
 		*engineerPubkey = os.Getenv("FREESO_ENGINEER_PUBKEY")
+	}
+
+	// Resolve automata-island namespace cf: --island-namespace-cf flag beats ISLAND_NAMESPACE_CF env.
+	// When set, successful purchase-lot and ensure-lot-cf calls register "lot-<id>" in the
+	// naming namespace so build-crew talents can discover lots without operator-handed hexes
+	// (automataisland-db2). When empty, naming registration is skipped (backward-compat).
+	if *islandNamespaceCF == "" {
+		*islandNamespaceCF = os.Getenv("ISLAND_NAMESPACE_CF")
 	}
 	var additionalAdmitKeys []string
 	if *engineerPubkey != "" {
@@ -276,16 +285,18 @@ func main() {
 		// Purchase-lot family (freesoexperiment-eaa): purchase-lot — was scaffold, now
 		// implemented. Road-bits pre-check via bot-cmd:probe-road, city-socket
 		// PurchaseLotRequest via bot-cmd:purchase-lot, owned-lots.json update on success.
-		// On success: asynchronously creates the lot campfire (automataisland-9b4).
-		purchaseServers, err := RegisterPurchaseLotHandlers(ctx, cf, botCmds, absHome, cf.PublicKeyHex)
+		// On success: asynchronously creates the lot campfire (automataisland-9b4) and
+		// registers it in the naming namespace (automataisland-db2).
+		purchaseServers, err := RegisterPurchaseLotHandlers(ctx, cf, botCmds, absHome, cf.PublicKeyHex, *islandNamespaceCF)
 		if err != nil {
 			log.Fatalf("register purchase-lot handlers: %v", err)
 		}
 		log.Printf("convention handlers: %d purchase-lot-family ops serving", purchaseServers)
 
-		// ensure-lot-cf (automataisland-9b4): one-shot recovery op for failed async
-		// lot-cf creation. Idempotent — safe to call for any lot_id at any time.
-		ensureLotCFServers, err := RegisterEnsureLotCFHandler(ctx, cf, absHome)
+		// ensure-lot-cf (automataisland-9b4, automataisland-db2): one-shot recovery op
+		// for failed async lot-cf creation. Also re-registers in naming namespace.
+		// Idempotent — safe to call for any lot_id at any time.
+		ensureLotCFServers, err := RegisterEnsureLotCFHandler(ctx, cf, absHome, *islandNamespaceCF)
 		if err != nil {
 			log.Fatalf("register ensure-lot-cf handler: %v", err)
 		}
