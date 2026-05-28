@@ -882,6 +882,131 @@ func TestEnsureLotCF_NamingRegister_MultiLot(t *testing.T) {
 	t.Logf("MultiLot: %d lots registered and discovered via naming.List + lot- filter", len(lotIDs))
 }
 
+// TestEnsureLotCF_NamingRegister_SeparateCfHomeResolver — automataisland-5a3.
+//
+// The pre-5a3 build-crew naming tests (TestEnsureLotCF_NamingRegister,
+// MultiLot, Idempotent) all used the SAME cfHome (the test's `tmp`) for both
+// EnsureLotCF's internal naming client and the verifying nsClient — they
+// shared the same store.db. A pass there only proved the same client could
+// read its own writes.
+//
+// The build-crew discovery scenario is different: a talent with its OWN
+// store (a different cfHome) discovers registered lots. This test creates a
+// fresh protocol.Init in a SEPARATE directory (resolverDir), joins the
+// namespace cf from that client, and calls naming.List + naming.Resolve to
+// find the registration. The filesystem-transport write happens during
+// EnsureLotCF; this test proves an external client (running from a different
+// cfHome) can pick the registration up via syncIfFilesystem during Join /
+// Read.
+//
+// Ground source — no mocks. Two genuine protocol.Init clients (different
+// dirs → different identities, different store.db). Build-crew = the
+// resolver-side; sidecar = the writer-side. Both must agree on the lot cf id
+// without sharing state.
+func TestEnsureLotCF_NamingRegister_SeparateCfHomeResolver(t *testing.T) {
+	ctx := context.Background()
+
+	// Sidecar side: the writer's cfHome (mirrors freeso-body@<persona> service).
+	sidecarTmp := t.TempDir()
+	beaconDir := filepath.Join(sidecarTmp, "beacons")
+	const lotID = int64(7777)
+
+	// Create the namespace cf via the sidecar's client (so the sidecar is
+	// admitted as creator/full — it has registration authority).
+	nsCFID, nsClient := newNamespaceCF(t, sidecarTmp)
+	defer nsClient.Close()
+
+	cfg := LotCFConfig{
+		CfHome:        sidecarTmp,
+		LotID:         lotID,
+		BeaconDir:     beaconDir,
+		NamespaceCFID: nsCFID,
+	}
+	lotCFID, ensureErr := EnsureLotCF(ctx, cfg)
+	if ensureErr != nil {
+		t.Fatalf("EnsureLotCF (writer): %v", ensureErr)
+	}
+	if len(lotCFID) != 64 {
+		t.Fatalf("lot campfire_id not 64 chars: %q", lotCFID)
+	}
+	t.Logf("writer (sidecar) registered lot %d → %s in namespace %s",
+		lotID, lotCFID[:12]+"…", nsCFID[:12]+"…")
+
+	// Build-crew side: a SEPARATE cfHome — different temp dir, different
+	// store.db, different identity. This is the build-crew talent reading
+	// the lot directory from their own machine.
+	//
+	// The namespace cf is filesystem-transport (created locally by
+	// newNamespaceCF). For the resolver to find the registration, it needs
+	// the namespace cf's transport dir on disk — newNamespaceCF places it at
+	// sidecarTmp/namespace/<nsCFID>/. We join the resolver from that
+	// transport dir but with the resolver's OWN protocol.Init in a separate
+	// resolverDir.
+	resolverDir := t.TempDir()
+	if resolverDir == sidecarTmp {
+		t.Fatalf("resolverDir collided with sidecarTmp — t.TempDir() should always be unique")
+	}
+	resolver, _, err := protocol.Init(resolverDir)
+	if err != nil {
+		t.Fatalf("resolver protocol.Init(%s): %v", resolverDir, err)
+	}
+	defer resolver.Close()
+
+	// The namespace cf was created `open` by newNamespaceCF, so the resolver
+	// (an unrelated identity) can join without admission. Once filesystem-
+	// invite-only is uniformly adopted, this test would also admit the
+	// resolver — proving the build-crew discovery flow under the strict
+	// model.
+	nsTransportDir := filepath.Join(sidecarTmp, "namespace", nsCFID)
+	if _, joinErr := resolver.Join(protocol.JoinRequest{
+		CampfireID: nsCFID,
+		Transport:  &protocol.FilesystemTransport{Dir: nsTransportDir},
+	}); joinErr != nil {
+		t.Fatalf("resolver join namespace cf: %v", joinErr)
+	}
+
+	// naming.List from the separate-cfHome client must surface the
+	// sidecar-side registration. This is the build-crew discovery proof.
+	expectedKey := LotNameKey(lotID)
+	regs, listErr := naming.List(ctx, resolver, nsCFID)
+	if listErr != nil {
+		t.Fatalf("resolver naming.List: %v", listErr)
+	}
+	var foundReg *naming.Registration
+	for i := range regs {
+		if regs[i].Name == expectedKey {
+			foundReg = &regs[i]
+			break
+		}
+	}
+	if foundReg == nil {
+		var names []string
+		for _, r := range regs {
+			names = append(names, r.Name)
+		}
+		t.Fatalf("separate-cfHome resolver naming.List: key %q not found. registered names from resolver's view: %v",
+			expectedKey, names)
+	}
+	if foundReg.CampfireID != lotCFID {
+		t.Errorf("separate-cfHome resolver naming.List campfire_id mismatch: want %s, got %s",
+			lotCFID[:12]+"…", foundReg.CampfireID[:12]+"…")
+	}
+	t.Logf("separate-cfHome resolver discovered %q → %s via naming.List ✓",
+		expectedKey, foundReg.CampfireID[:12]+"…")
+
+	// naming.Resolve from the separate-cfHome client must also resolve.
+	resp, resolveErr := naming.Resolve(ctx, resolver, nsCFID, expectedKey)
+	if resolveErr != nil {
+		t.Fatalf("separate-cfHome resolver naming.Resolve(%q): %v", expectedKey, resolveErr)
+	}
+	if resp.CampfireID != lotCFID {
+		t.Errorf("separate-cfHome resolver naming.Resolve campfire_id mismatch: want %s, got %s",
+			lotCFID[:12]+"…", resp.CampfireID[:12]+"…")
+	}
+	t.Logf("separate-cfHome resolver naming.Resolve(%q) → %s ✓ (build-crew discovery scenario PASS)",
+		expectedKey, resp.CampfireID[:12]+"…")
+}
+
 // TestEnsureLotCF_NamingRegister_NoNamespaceCFID verifies backward-compat: when
 // NamespaceCFID is empty, EnsureLotCF succeeds without attempting naming registration.
 func TestEnsureLotCF_NamingRegister_NoNamespaceCFID(t *testing.T) {
