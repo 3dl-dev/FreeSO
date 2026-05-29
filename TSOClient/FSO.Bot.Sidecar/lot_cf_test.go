@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1197,6 +1198,153 @@ func TestLotRetire_NamingUnregister(t *testing.T) {
 		}
 	}
 	t.Logf("naming.List after LotRetire: key %q not found in list ✓", nameKey)
+}
+
+// ============================================================================
+// Concurrency regression test — automataisland-57d TOCTOU fix
+// ============================================================================
+
+// TestEnsureLotCF_ConcurrentSameLotID is the regression test for the TOCTOU
+// race fixed in automataisland-57d.
+//
+// Before the fix: two concurrent EnsureLotCF callers for the same lot_id
+// could both observe a missing beacon, both call protocol.Client.Create(), and
+// produce TWO DISTINCT campfires. Whichever renamed the beacon file last would
+// "win," but both campfires would exist on disk — a silent data divergence.
+//
+// After the fix: per-lot mutex serializes callers. The second caller waits,
+// then finds the beacon written by the first and returns the same campfire ID.
+//
+// This test MUST FAIL without the sync.Mutex map in EnsureLotCF and MUST PASS
+// with it. Specifically it asserts:
+//
+//  1. All N goroutines complete without error.
+//  2. All N goroutines return exactly the same campfire ID.
+//  3. Exactly ONE lot-campfire transport directory exists on disk.
+//  4. The naming namespace contains exactly one registration for "lot-<id>".
+func TestEnsureLotCF_ConcurrentSameLotID(t *testing.T) {
+	const (
+		lotID      = int64(31337) // canonical lot_id for this test
+		goroutines = 8            // enough concurrency to surface the race reliably
+	)
+
+	ctx := context.Background()
+	tmp := t.TempDir()
+	beaconDir := filepath.Join(tmp, "beacons")
+
+	// Create a real namespace campfire so the naming-uniqueness assertion has
+	// something to check against. Uses the sidecar's cfHome so the sidecar
+	// identity is admitted on the namespace.
+	nsCFID, nsClient := newNamespaceCF(t, tmp)
+	defer nsClient.Close()
+
+	cfg := LotCFConfig{
+		CfHome:        tmp,
+		LotID:         lotID,
+		BeaconDir:     beaconDir,
+		NamespaceCFID: nsCFID,
+	}
+
+	// Collect results from all goroutines.
+	type result struct {
+		campfireID string
+		err        error
+	}
+	results := make([]result, goroutines)
+
+	// Use a WaitGroup + barrier (all goroutines ready before any proceeds) to
+	// maximise the window for a race.
+	var wg sync.WaitGroup
+	barrier := make(chan struct{})
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		i := i
+		go func() {
+			defer wg.Done()
+			<-barrier // wait for all goroutines to be ready
+			id, err := EnsureLotCF(ctx, cfg)
+			results[i] = result{campfireID: id, err: err}
+		}()
+	}
+
+	// Release all goroutines simultaneously.
+	close(barrier)
+	wg.Wait()
+
+	// 1. All goroutines must succeed.
+	for i, r := range results {
+		if r.err != nil {
+			t.Errorf("goroutine %d: EnsureLotCF error: %v", i, r.err)
+		}
+	}
+
+	// 2. All goroutines must return the same campfire ID.
+	first := results[0].campfireID
+	if first == "" {
+		t.Fatal("goroutine 0: returned empty campfire ID")
+	}
+	for i, r := range results[1:] {
+		if r.campfireID != first {
+			t.Errorf("goroutine %d returned different campfire ID: want %s…, got %s…",
+				i+1, first[:12], r.campfireID[:12])
+		}
+	}
+	t.Logf("all %d goroutines returned campfire_id=%s…", goroutines, first[:12])
+
+	// 3. Exactly ONE lot-campfire transport directory must exist.
+	// Transport dirs are at <cfHome>/lot-campfires/<lotID>/. The race would
+	// create two separate subdirs for the same lot_id if the fix is absent.
+	lotCampfireRoot := filepath.Join(tmp, "lot-campfires")
+	entries, readErr := os.ReadDir(lotCampfireRoot)
+	if readErr != nil {
+		t.Fatalf("ReadDir lot-campfires: %v", readErr)
+	}
+	if len(entries) != 1 {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("expected exactly 1 lot-campfire transport dir, got %d: %v", len(entries), names)
+	} else {
+		t.Logf("exactly 1 transport dir under lot-campfires: %s", entries[0].Name())
+	}
+
+	// 4. Naming namespace must contain exactly one registration for "lot-<id>".
+	// naming.List returns all registrations (including duplicates from racing
+	// naming.Register calls). After the fix, only one campfire can exist, so
+	// there can be at most one unique campfire_id in the list — even if naming
+	// called Register multiple times, they all point to the same campfire.
+	nameKey := LotNameKey(lotID)
+	regs, listErr := naming.List(ctx, nsClient, nsCFID)
+	if listErr != nil {
+		t.Fatalf("naming.List: %v", listErr)
+	}
+
+	// Collect all campfire IDs registered under nameKey.
+	cfIDSet := make(map[string]int) // campfire_id → count
+	for _, r := range regs {
+		if r.Name == nameKey {
+			cfIDSet[r.CampfireID]++
+		}
+	}
+	if len(cfIDSet) == 0 {
+		t.Errorf("naming.List: no registration for %q found", nameKey)
+	} else if len(cfIDSet) > 1 {
+		// More than one distinct campfire ID registered for the same lot — this
+		// is the data-divergence the fix prevents.
+		t.Errorf("naming.List: %d distinct campfire IDs registered for %q (want 1): %v",
+			len(cfIDSet), nameKey, cfIDSet)
+	} else {
+		// Exactly one unique campfire ID — verify it matches what goroutines returned.
+		for id := range cfIDSet {
+			if id != first {
+				t.Errorf("naming registration campfire_id=%s… does not match goroutine result %s…",
+					id[:12], first[:12])
+			}
+		}
+		t.Logf("naming.List: exactly 1 unique campfire_id for %q (%s…) ✓", nameKey, first[:12])
+	}
 }
 
 // lotKeys returns the lot- keys from a name→campfire_id map for error messages.

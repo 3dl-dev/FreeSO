@@ -61,12 +61,46 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/campfire-net/campfire/cf-conventions/cf-convention"
 	"github.com/campfire-net/campfire/cf-protocol/protocol"
 	"github.com/campfire-net/campfire/pkg/naming"
 )
+
+// lotCFMu serializes EnsureLotCF calls per lot_id to prevent a TOCTOU race
+// where two concurrent callers both observe a missing beacon and each proceed
+// to create a distinct campfire for the same lot.
+//
+// Cross-lot parallelism is preserved: goroutines for different lot_ids acquire
+// different mutexes and never block each other.
+//
+// Lifecycle: mutexes are only added, never deleted. For a sidecar process that
+// manages O(thousands) of lots, the map grows to at most one entry per lot — a
+// negligible footprint.
+var (
+	lotCFMuMu sync.Mutex            // protects the map itself
+	lotCFMus  map[int64]*sync.Mutex // per-lot mutexes
+)
+
+func init() {
+	lotCFMus = make(map[int64]*sync.Mutex)
+}
+
+// lotMu returns the per-lot mutex for lotID, creating it if necessary.
+// The map-level lock (lotCFMuMu) is held only long enough to read/insert the
+// per-lot entry — it is never held while the per-lot work executes.
+func lotMu(lotID int64) *sync.Mutex {
+	lotCFMuMu.Lock()
+	mu, ok := lotCFMus[lotID]
+	if !ok {
+		mu = &sync.Mutex{}
+		lotCFMus[lotID] = mu
+	}
+	lotCFMuMu.Unlock()
+	return mu
+}
 
 const (
 	// lotCFBeaconDirDefault is the default directory for lot beacon files.
@@ -194,6 +228,15 @@ func LotNameKey(lotID int64) string {
 //
 // Returns the campfire ID on success, even if already existed.
 func EnsureLotCF(ctx context.Context, cfg LotCFConfig) (campfireID string, err error) {
+	// Serialize per lot_id to prevent TOCTOU: two concurrent callers for the
+	// same lot_id must not both observe a missing beacon and each create a
+	// separate campfire. The second caller will wait here; on entry it will
+	// find the beacon already written and take the idempotent return path.
+	// Cross-lot parallelism is unaffected — different lot_ids use different mutexes.
+	mu := lotMu(cfg.LotID)
+	mu.Lock()
+	defer mu.Unlock()
+
 	transportDir := lotTransportDir(cfg.CfHome, cfg.LotID)
 	beaconDir := effectiveBeaconDir(cfg)
 	beaconPath := filepath.Join(beaconDir, strconv.FormatInt(cfg.LotID, 10)+".beacon")
