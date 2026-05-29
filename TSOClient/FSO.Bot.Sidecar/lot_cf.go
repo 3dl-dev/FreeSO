@@ -65,6 +65,7 @@ import (
 
 	"github.com/campfire-net/campfire/cf-conventions/cf-convention"
 	"github.com/campfire-net/campfire/cf-protocol/protocol"
+	"github.com/campfire-net/campfire/pkg/naming"
 )
 
 const (
@@ -94,6 +95,13 @@ type LotCFConfig struct {
 	// BeaconDir overrides the beacon directory when non-empty.
 	// Default: LOT_CF_BEACON_DIR env var or /var/freeso/lot-beacons.
 	BeaconDir string
+
+	// NamespaceCFID is the hex campfire ID of the automata-island naming namespace.
+	// When non-empty, EnsureLotCF calls naming.Register to publish "lot-<id>"
+	// in the namespace so build-crew talents can discover the lot without a hex.
+	// Sourced from ISLAND_NAMESPACE_CF env var or the --island-namespace-cf flag.
+	// Optional: if empty, naming registration is skipped (backward-compat).
+	NamespaceCFID string
 }
 
 // LotCFIDs holds the derived identifiers for a lot campfire.
@@ -151,6 +159,16 @@ func lotTransportDir(cfHome string, lotID int64) string {
 	return filepath.Join(cfHome, "lot-campfires", strconv.FormatInt(lotID, 10))
 }
 
+// LotNameKey returns the naming registration key for a lot.
+// Format: "lot-<id>" (single-segment key in the automata-island namespace cf).
+// Example: lot_id=42 → "lot-42".
+//
+// naming.ValidateSegment enforces [a-z0-9][a-z0-9-]*[a-z0-9] — decimal lot IDs
+// contain only digits and are always valid after the "lot-" prefix is prepended.
+func LotNameKey(lotID int64) string {
+	return "lot-" + strconv.FormatInt(lotID, 10)
+}
+
 // EnsureLotCF creates the lot campfire for lotID if it does not already exist.
 // This function is idempotent: calling it for a lot_id that already has a campfire
 // is a no-op (the existing campfire is returned unchanged).
@@ -171,9 +189,11 @@ func lotTransportDir(cfHome string, lotID int64) string {
 //  2. Create the campfire (filesystem transport, invite-only).
 //  3. Admit OwnerPubKeyHex as creator (role=full).
 //  4. Write beacon file to beaconDir/<lotID>.beacon.
+//  5. If NamespaceCFID is set, call naming.Register("lot-<id>") in the namespace
+//     campfire (non-fatal if it fails — campfire and beacon already committed).
 //
 // Returns the campfire ID on success, even if already existed.
-func EnsureLotCF(cfg LotCFConfig) (campfireID string, err error) {
+func EnsureLotCF(ctx context.Context, cfg LotCFConfig) (campfireID string, err error) {
 	transportDir := lotTransportDir(cfg.CfHome, cfg.LotID)
 	beaconDir := effectiveBeaconDir(cfg)
 	beaconPath := filepath.Join(beaconDir, strconv.FormatInt(cfg.LotID, 10)+".beacon")
@@ -184,6 +204,12 @@ func EnsureLotCF(cfg LotCFConfig) (campfireID string, err error) {
 		if existingID != "" {
 			log.Printf("lot-cf: lot %d campfire %s already exists (beacon found) — skipping creation",
 				cfg.LotID, shortID(existingID))
+			// Even on the idempotent path, attempt naming registration if configured.
+			// naming.Register is idempotent at the campfire level (it posts a message;
+			// duplicate registrations are resolved to the most recent by Resolve/List).
+			if cfg.NamespaceCFID != "" {
+				registerLotName(ctx, cfg, existingID)
+			}
 			return existingID, nil
 		}
 	}
@@ -236,11 +262,47 @@ func EnsureLotCF(cfg LotCFConfig) (campfireID string, err error) {
 	if bErr := writeLotBeacon(cfg, campfireID); bErr != nil {
 		// Non-fatal: campfire created, owner admitted. Beacon re-writable via ensure-lot-cf.
 		log.Printf("lot-cf: lot %d write beacon: %v (non-fatal — campfire created)", cfg.LotID, bErr)
+		// Still attempt naming registration even if beacon write failed — the campfire
+		// exists and is usable; naming is discovery metadata that can be retried.
+		if cfg.NamespaceCFID != "" {
+			registerLotName(ctx, cfg, campfireID)
+		}
 		return campfireID, nil
+	}
+
+	// Register in the automata-island naming namespace so build-crew talents can
+	// discover the lot cf by name without a hex (automataisland-db2).
+	if cfg.NamespaceCFID != "" {
+		registerLotName(ctx, cfg, campfireID)
 	}
 
 	log.Printf("lot-cf: lot %d setup complete campfire_id=%s beacon_dir=%s", cfg.LotID, shortID(campfireID), effectiveBeaconDir(cfg))
 	return campfireID, nil
+}
+
+// registerLotName publishes "lot-<lotID>" in the automata-island namespace campfire.
+// Non-fatal: a registration failure is logged but does not prevent the caller from
+// returning the campfire ID — the campfire itself is already created and the beacon
+// written. Naming is discovery metadata; it can be retried via ensure-lot-cf.
+func registerLotName(ctx context.Context, cfg LotCFConfig, campfireID string) {
+	nameKey := LotNameKey(cfg.LotID)
+	// Open a fresh protocol client pointed at cfHome to talk to the namespace cf.
+	// The namespace cf may use a different (relay) transport than the lot cf; Init
+	// auto-discovers the right transport from the auto_join config in cfHome.
+	nsClient, _, initErr := protocol.Init(cfg.CfHome)
+	if initErr != nil {
+		log.Printf("lot-cf: lot %d naming.Register %q: protocol.Init: %v (non-fatal)", cfg.LotID, nameKey, initErr)
+		return
+	}
+	defer nsClient.Close()
+
+	_, regErr := naming.Register(ctx, nsClient, cfg.NamespaceCFID, nameKey, campfireID,
+		&naming.RegisterOptions{TTL: naming.MaxTTL})
+	if regErr != nil {
+		log.Printf("lot-cf: lot %d naming.Register %q in ns %s: %v (non-fatal)", cfg.LotID, nameKey, shortID(cfg.NamespaceCFID), regErr)
+		return
+	}
+	log.Printf("lot-cf: lot %d registered %q → %s in namespace %s", cfg.LotID, nameKey, shortID(campfireID), shortID(cfg.NamespaceCFID))
 }
 
 // writeLotBeacon atomically writes the lot campfire beacon file.
@@ -286,7 +348,8 @@ func writeLotBeaconErr(cfg LotCFConfig, reason error) {
 // Failures are logged and written to a .beacon.err file for operator recovery.
 func SpawnLotCFAsync(cfg LotCFConfig) {
 	go func() {
-		if _, ensureErr := EnsureLotCF(cfg); ensureErr != nil {
+		ctx := context.Background()
+		if _, ensureErr := EnsureLotCF(ctx, cfg); ensureErr != nil {
 			log.Printf("lot-cf: lot %d async creation FAILED: %v — run ensure-lot-cf --lot_id %d to recover",
 				cfg.LotID, ensureErr, cfg.LotID)
 			writeLotBeaconErr(cfg, ensureErr)
@@ -306,9 +369,10 @@ func SpawnLotCFAsync(cfg LotCFConfig) {
 // Response: {ok: true, campfire_id: "<hex>", lot_id: <int>} on success.
 //
 // The cfHome parameter must be the same --cf-home path used when the sidecar
-// was launched so the protocol.Client uses the sidecar's identity.
-func RegisterEnsureLotCFHandler(ctx context.Context, cf *Campfire, cfHome string) (int, error) {
-	handler := buildEnsureLotCFHandler(cf, cfHome)
+// was launched so the protocol.Client uses the sidecar's identity. namespaceCFID
+// is threaded through to EnsureLotCF so ensure-lot-cf also registers the name.
+func RegisterEnsureLotCFHandler(ctx context.Context, cf *Campfire, cfHome, namespaceCFID string) (int, error) {
+	handler := buildEnsureLotCFHandler(cf, cfHome, namespaceCFID)
 
 	decls, err := LoadDeclarations(conventionFiles)
 	if err != nil {
@@ -324,7 +388,7 @@ func RegisterEnsureLotCFHandler(ctx context.Context, cf *Campfire, cfHome string
 }
 
 // buildEnsureLotCFHandler returns the convention.HandlerFunc for ensure-lot-cf.
-func buildEnsureLotCFHandler(bodyCF *Campfire, cfHome string) convention.HandlerFunc {
+func buildEnsureLotCFHandler(bodyCF *Campfire, cfHome, namespaceCFID string) convention.HandlerFunc {
 	return func(ctx context.Context, req *convention.Request) (*convention.Response, error) {
 		// Extract lot_id from args.
 		rawLotID, ok := req.Args["lot_id"]
@@ -349,8 +413,9 @@ func buildEnsureLotCFHandler(bodyCF *Campfire, cfHome string) convention.Handler
 			CfHome:         cfHome,
 			LotID:          lotID,
 			OwnerPubKeyHex: bodyCF.PublicKeyHex,
+			NamespaceCFID:  namespaceCFID,
 		}
-		campfireID, ensureErr := EnsureLotCF(cfg)
+		campfireID, ensureErr := EnsureLotCF(ctx, cfg)
 		if ensureErr != nil {
 			return &convention.Response{
 				Payload: map[string]any{

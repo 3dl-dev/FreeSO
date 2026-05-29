@@ -28,7 +28,7 @@ func TestPurchaseLotHandlerMissingLocation(t *testing.T) {
 		}
 	}()
 
-	handler := purchaseLotHandler(pump, "", "")
+	handler := purchaseLotHandler(pump, "", "", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -57,7 +57,7 @@ func TestPurchaseLotHandlerMissingName(t *testing.T) {
 		}
 	}()
 
-	handler := purchaseLotHandler(pump, "", "")
+	handler := purchaseLotHandler(pump, "", "", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -102,7 +102,7 @@ func TestPurchaseLotHandlerNoRoadBits(t *testing.T) {
 		}))
 	}()
 
-	handler := purchaseLotHandler(pump, "", "")
+	handler := purchaseLotHandler(pump, "", "", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -148,7 +148,7 @@ func TestPurchaseLotHandlerAlreadyOwns(t *testing.T) {
 		}
 	}()
 
-	handler := purchaseLotHandler(pump, "", "")
+	handler := purchaseLotHandler(pump, "", "", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -209,7 +209,7 @@ func TestPurchaseLotHandlerAllowMoveBypassesAlreadyOwns(t *testing.T) {
 		}))
 	}()
 
-	handler := purchaseLotHandler(pump, "", "")
+	handler := purchaseLotHandler(pump, "", "", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -307,7 +307,7 @@ func TestPurchaseLotHandlerSuccessPath(t *testing.T) {
 		}))
 	}()
 
-	handler := purchaseLotHandler(pump, "", "")
+	handler := purchaseLotHandler(pump, "", "", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -429,7 +429,7 @@ func TestPurchaseLotHandlerServerRefuseNhoodReserved(t *testing.T) {
 		}))
 	}()
 
-	handler := purchaseLotHandler(pump, "", "")
+	handler := purchaseLotHandler(pump, "", "", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -463,7 +463,7 @@ func TestPurchaseLotHandlerServerRefuseNhoodReserved(t *testing.T) {
 // TestPurchaseLotHandlerNoBotMode asserts that a nil botCmds returns a
 // deferred marker rather than panicking.
 func TestPurchaseLotHandlerNoBotMode(t *testing.T) {
-	handler := purchaseLotHandler(nil, "", "") // nil = --no-bot mode
+	handler := purchaseLotHandler(nil, "", "", "") // nil = --no-bot mode
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -551,7 +551,7 @@ func TestPurchaseLotHandlerLotNotPurchasable(t *testing.T) {
 		}))
 	}()
 
-	handler := purchaseLotHandler(pump, "", "")
+	handler := purchaseLotHandler(pump, "", "", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -654,7 +654,7 @@ func TestPurchaseLotHandlerCommunityLotTHNotMayor(t *testing.T) {
 		}))
 	}()
 
-	handler := purchaseLotHandler(pump, "", "")
+	handler := purchaseLotHandler(pump, "", "", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -737,7 +737,7 @@ func TestPurchaseLotHandlerMoneyLotSuccess(t *testing.T) {
 		}))
 	}()
 
-	handler := purchaseLotHandler(pump, "", "")
+	handler := purchaseLotHandler(pump, "", "", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -828,7 +828,7 @@ func TestPurchaseLotHandlerWelcomeLotSuccess(t *testing.T) {
 		}))
 	}()
 
-	handler := purchaseLotHandler(pump, "", "")
+	handler := purchaseLotHandler(pump, "", "", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 

@@ -44,10 +44,12 @@ import (
 //
 // cfHome is the sidecar's campfire home directory (--cf-home), passed through
 // for lot-cf creation. ownerPubKeyHex is the sidecar's public key hex (the lot
-// owner identity). Both are used by SpawnLotCFAsync on the success path.
-func RegisterPurchaseLotHandlers(ctx context.Context, cf *Campfire, botCmds *BotCmdPump, cfHome, ownerPubKeyHex string) (int, error) {
+// owner identity). namespaceCFID is the automata-island naming namespace campfire
+// ID (hex); when non-empty, successful purchases register "lot-<id>" in it.
+// All three are used by SpawnLotCFAsync on the success path.
+func RegisterPurchaseLotHandlers(ctx context.Context, cf *Campfire, botCmds *BotCmdPump, cfHome, ownerPubKeyHex, namespaceCFID string) (int, error) {
 	ops := map[string]convention.HandlerFunc{
-		"purchase-lot": purchaseLotHandler(botCmds, cfHome, ownerPubKeyHex),
+		"purchase-lot": purchaseLotHandler(botCmds, cfHome, ownerPubKeyHex, namespaceCFID),
 	}
 
 	decls, err := LoadDeclarations(conventionFiles)
@@ -84,9 +86,11 @@ func RegisterPurchaseLotHandlers(ctx context.Context, cf *Campfire, botCmds *Bot
 //   - allow_move (bool, default false): if true, skip the ALREADY_OWNS check.
 //     Set when the agent explicitly wants to re-purchase / move.
 //
-// cfHome and ownerPubKeyHex are forwarded to SpawnLotCFAsync on the success path
-// (automataisland-9b4). Empty strings disable lot-cf creation (e.g. in --no-bot mode).
-func purchaseLotHandler(botCmds *BotCmdPump, cfHome, ownerPubKeyHex string) convention.HandlerFunc {
+// cfHome, ownerPubKeyHex, and namespaceCFID are forwarded to SpawnLotCFAsync
+// on the success path (automataisland-9b4, automataisland-db2). Empty cfHome
+// disables lot-cf creation (e.g. in --no-bot mode). Empty namespaceCFID skips
+// naming registration (backward-compat).
+func purchaseLotHandler(botCmds *BotCmdPump, cfHome, ownerPubKeyHex, namespaceCFID string) convention.HandlerFunc {
 	return func(ctx context.Context, req *convention.Request) (*convention.Response, error) {
 		args := req.Args
 
@@ -286,6 +290,7 @@ func purchaseLotHandler(botCmds *BotCmdPump, cfHome, ownerPubKeyHex string) conv
 					CfHome:         cfHome,
 					LotID:          purchaseData.LotID,
 					OwnerPubKeyHex: ownerPubKeyHex,
+					NamespaceCFID:  namespaceCFID,
 				})
 			} else {
 				log.Printf("purchase-lot: lot %d — cfHome empty, skipping lot-cf creation", purchaseData.LotID)
