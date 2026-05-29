@@ -882,6 +882,131 @@ func TestEnsureLotCF_NamingRegister_MultiLot(t *testing.T) {
 	t.Logf("MultiLot: %d lots registered and discovered via naming.List + lot- filter", len(lotIDs))
 }
 
+// TestEnsureLotCF_NamingRegister_SeparateCfHomeResolver — automataisland-5a3.
+//
+// The pre-5a3 build-crew naming tests (TestEnsureLotCF_NamingRegister,
+// MultiLot, Idempotent) all used the SAME cfHome (the test's `tmp`) for both
+// EnsureLotCF's internal naming client and the verifying nsClient — they
+// shared the same store.db. A pass there only proved the same client could
+// read its own writes.
+//
+// The build-crew discovery scenario is different: a talent with its OWN
+// store (a different cfHome) discovers registered lots. This test creates a
+// fresh protocol.Init in a SEPARATE directory (resolverDir), joins the
+// namespace cf from that client, and calls naming.List + naming.Resolve to
+// find the registration. The filesystem-transport write happens during
+// EnsureLotCF; this test proves an external client (running from a different
+// cfHome) can pick the registration up via syncIfFilesystem during Join /
+// Read.
+//
+// Ground source — no mocks. Two genuine protocol.Init clients (different
+// dirs → different identities, different store.db). Build-crew = the
+// resolver-side; sidecar = the writer-side. Both must agree on the lot cf id
+// without sharing state.
+func TestEnsureLotCF_NamingRegister_SeparateCfHomeResolver(t *testing.T) {
+	ctx := context.Background()
+
+	// Sidecar side: the writer's cfHome (mirrors freeso-body@<persona> service).
+	sidecarTmp := t.TempDir()
+	beaconDir := filepath.Join(sidecarTmp, "beacons")
+	const lotID = int64(7777)
+
+	// Create the namespace cf via the sidecar's client (so the sidecar is
+	// admitted as creator/full — it has registration authority).
+	nsCFID, nsClient := newNamespaceCF(t, sidecarTmp)
+	defer nsClient.Close()
+
+	cfg := LotCFConfig{
+		CfHome:        sidecarTmp,
+		LotID:         lotID,
+		BeaconDir:     beaconDir,
+		NamespaceCFID: nsCFID,
+	}
+	lotCFID, ensureErr := EnsureLotCF(ctx, cfg)
+	if ensureErr != nil {
+		t.Fatalf("EnsureLotCF (writer): %v", ensureErr)
+	}
+	if len(lotCFID) != 64 {
+		t.Fatalf("lot campfire_id not 64 chars: %q", lotCFID)
+	}
+	t.Logf("writer (sidecar) registered lot %d → %s in namespace %s",
+		lotID, lotCFID[:12]+"…", nsCFID[:12]+"…")
+
+	// Build-crew side: a SEPARATE cfHome — different temp dir, different
+	// store.db, different identity. This is the build-crew talent reading
+	// the lot directory from their own machine.
+	//
+	// The namespace cf is filesystem-transport (created locally by
+	// newNamespaceCF). For the resolver to find the registration, it needs
+	// the namespace cf's transport dir on disk — newNamespaceCF places it at
+	// sidecarTmp/namespace/<nsCFID>/. We join the resolver from that
+	// transport dir but with the resolver's OWN protocol.Init in a separate
+	// resolverDir.
+	resolverDir := t.TempDir()
+	if resolverDir == sidecarTmp {
+		t.Fatalf("resolverDir collided with sidecarTmp — t.TempDir() should always be unique")
+	}
+	resolver, _, err := protocol.Init(resolverDir)
+	if err != nil {
+		t.Fatalf("resolver protocol.Init(%s): %v", resolverDir, err)
+	}
+	defer resolver.Close()
+
+	// The namespace cf was created `open` by newNamespaceCF, so the resolver
+	// (an unrelated identity) can join without admission. Once filesystem-
+	// invite-only is uniformly adopted, this test would also admit the
+	// resolver — proving the build-crew discovery flow under the strict
+	// model.
+	nsTransportDir := filepath.Join(sidecarTmp, "namespace", nsCFID)
+	if _, joinErr := resolver.Join(protocol.JoinRequest{
+		CampfireID: nsCFID,
+		Transport:  &protocol.FilesystemTransport{Dir: nsTransportDir},
+	}); joinErr != nil {
+		t.Fatalf("resolver join namespace cf: %v", joinErr)
+	}
+
+	// naming.List from the separate-cfHome client must surface the
+	// sidecar-side registration. This is the build-crew discovery proof.
+	expectedKey := LotNameKey(lotID)
+	regs, listErr := naming.List(ctx, resolver, nsCFID)
+	if listErr != nil {
+		t.Fatalf("resolver naming.List: %v", listErr)
+	}
+	var foundReg *naming.Registration
+	for i := range regs {
+		if regs[i].Name == expectedKey {
+			foundReg = &regs[i]
+			break
+		}
+	}
+	if foundReg == nil {
+		var names []string
+		for _, r := range regs {
+			names = append(names, r.Name)
+		}
+		t.Fatalf("separate-cfHome resolver naming.List: key %q not found. registered names from resolver's view: %v",
+			expectedKey, names)
+	}
+	if foundReg.CampfireID != lotCFID {
+		t.Errorf("separate-cfHome resolver naming.List campfire_id mismatch: want %s, got %s",
+			lotCFID[:12]+"…", foundReg.CampfireID[:12]+"…")
+	}
+	t.Logf("separate-cfHome resolver discovered %q → %s via naming.List ✓",
+		expectedKey, foundReg.CampfireID[:12]+"…")
+
+	// naming.Resolve from the separate-cfHome client must also resolve.
+	resp, resolveErr := naming.Resolve(ctx, resolver, nsCFID, expectedKey)
+	if resolveErr != nil {
+		t.Fatalf("separate-cfHome resolver naming.Resolve(%q): %v", expectedKey, resolveErr)
+	}
+	if resp.CampfireID != lotCFID {
+		t.Errorf("separate-cfHome resolver naming.Resolve campfire_id mismatch: want %s, got %s",
+			lotCFID[:12]+"…", resp.CampfireID[:12]+"…")
+	}
+	t.Logf("separate-cfHome resolver naming.Resolve(%q) → %s ✓ (build-crew discovery scenario PASS)",
+		expectedKey, resp.CampfireID[:12]+"…")
+}
+
 // TestEnsureLotCF_NamingRegister_NoNamespaceCFID verifies backward-compat: when
 // NamespaceCFID is empty, EnsureLotCF succeeds without attempting naming registration.
 func TestEnsureLotCF_NamingRegister_NoNamespaceCFID(t *testing.T) {
@@ -906,6 +1031,172 @@ func TestEnsureLotCF_NamingRegister_NoNamespaceCFID(t *testing.T) {
 	}
 	// No naming assertion — just verifying EnsureLotCF works without NamespaceCFID.
 	t.Logf("NoNamespaceCFID: lot %d → campfire_id=%s (no naming)", lotID, id[:12]+"…")
+}
+
+// TestEnsureLotCF_ReregistrationAfterBeaconDelete verifies the re-registration
+// path: if the beacon file is deleted (simulating a "lot was re-created with a
+// new campfire ID" scenario), a subsequent call to EnsureLotCF creates a NEW
+// campfire with a different ID, writes a new beacon, and naming.Resolve returns
+// the NEW campfire ID — not the old one.
+//
+// Spec reference: lot_cf.go:206-214 — on the idempotent path (beacon exists),
+// registerLotName is called again. This test covers the inverse: beacon deleted
+// → EnsureLotCF creates new cf → Resolve returns new ID.
+//
+// Ground source: real protocol.Client + real namespace campfire + real
+// naming.Register / naming.Resolve. No mocks.
+func TestEnsureLotCF_ReregistrationAfterBeaconDelete(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	beaconDir := filepath.Join(tmp, "beacons")
+	const lotID = int64(4242)
+
+	// Create a real namespace campfire in the sidecar's cfHome.
+	nsCFID, nsClient := newNamespaceCF(t, tmp)
+	defer nsClient.Close()
+
+	cfg := LotCFConfig{
+		CfHome:        tmp,
+		LotID:         lotID,
+		BeaconDir:     beaconDir,
+		NamespaceCFID: nsCFID,
+	}
+
+	// First call: creates campfire, writes beacon, registers name.
+	oldCFID, err := EnsureLotCF(ctx, cfg)
+	if err != nil {
+		t.Fatalf("EnsureLotCF (first): %v", err)
+	}
+	if len(oldCFID) != 64 {
+		t.Fatalf("first campfire_id not 64 chars: %q", oldCFID)
+	}
+	t.Logf("first lot cf: %s", oldCFID[:12]+"…")
+
+	// Verify Resolve returns the old ID.
+	nameKey := LotNameKey(lotID)
+	resp, resolveErr := naming.Resolve(ctx, nsClient, nsCFID, nameKey)
+	if resolveErr != nil {
+		t.Fatalf("naming.Resolve after first EnsureLotCF: %v", resolveErr)
+	}
+	if resp.CampfireID != oldCFID {
+		t.Errorf("naming.Resolve (first): want %s, got %s", oldCFID[:12]+"…", resp.CampfireID[:12]+"…")
+	}
+
+	// Delete the beacon file — simulating "lot was re-created with a new campfire".
+	// Also remove the old lot-campfire transport directory so Create() can make a new one.
+	beaconPath := filepath.Join(beaconDir, strconv.FormatInt(lotID, 10)+".beacon")
+	if err := os.Remove(beaconPath); err != nil {
+		t.Fatalf("remove beacon: %v", err)
+	}
+	oldTransportDir := lotTransportDir(tmp, lotID)
+	if err := os.RemoveAll(oldTransportDir); err != nil {
+		t.Fatalf("remove old transport dir: %v", err)
+	}
+	t.Logf("beacon deleted, old transport dir removed — simulating re-creation")
+
+	// Second call: beacon gone → EnsureLotCF must create a NEW campfire.
+	newCFID, err2 := EnsureLotCF(ctx, cfg)
+	if err2 != nil {
+		t.Fatalf("EnsureLotCF (second, after beacon delete): %v", err2)
+	}
+	if len(newCFID) != 64 {
+		t.Fatalf("new campfire_id not 64 chars: %q", newCFID)
+	}
+	t.Logf("new lot cf: %s", newCFID[:12]+"…")
+
+	// The new campfire ID must differ from the old one (it's freshly created).
+	if newCFID == oldCFID {
+		t.Errorf("re-registration: new campfire_id should differ from old one (both %s)", oldCFID[:12]+"…")
+	}
+
+	// naming.Resolve must now return the NEW campfire ID, not the old one.
+	resp2, resolveErr2 := naming.Resolve(ctx, nsClient, nsCFID, nameKey)
+	if resolveErr2 != nil {
+		t.Fatalf("naming.Resolve after beacon delete + re-creation: %v", resolveErr2)
+	}
+	if resp2.CampfireID != newCFID {
+		t.Errorf("naming.Resolve (after re-registration): want new ID %s, got %s",
+			newCFID[:12]+"…", resp2.CampfireID[:12]+"…")
+	}
+	t.Logf("re-registration: naming.Resolve returns NEW ID %s (not old %s) ✓",
+		newCFID[:12]+"…", oldCFID[:12]+"…")
+}
+
+// TestLotRetire_NamingUnregister verifies that LotRetire calls naming.Unregister
+// for the lot such that naming.Resolve returns "not found" after retirement.
+//
+// Spec reference: docs/naming.md §Retirement — sidecar calls naming.Unregister
+// on "lot-<id>" at retirement. No prior implementation existed.
+//
+// Done conditions:
+//   - After LotRetire, naming.Resolve("lot-<id>") returns an error (name not found).
+//   - naming.List does not include the retired lot's key.
+//
+// Ground source: real protocol.Client + real naming.Register / naming.Unregister /
+// naming.Resolve. No mocks.
+func TestLotRetire_NamingUnregister(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	beaconDir := filepath.Join(tmp, "beacons")
+	const lotID = int64(8080)
+
+	// Create a real namespace campfire.
+	nsCFID, nsClient := newNamespaceCF(t, tmp)
+	defer nsClient.Close()
+
+	cfg := LotCFConfig{
+		CfHome:        tmp,
+		LotID:         lotID,
+		BeaconDir:     beaconDir,
+		NamespaceCFID: nsCFID,
+	}
+
+	// Register the lot via EnsureLotCF first.
+	lotCFID, ensureErr := EnsureLotCF(ctx, cfg)
+	if ensureErr != nil {
+		t.Fatalf("EnsureLotCF: %v", ensureErr)
+	}
+	if len(lotCFID) != 64 {
+		t.Fatalf("lot campfire_id not 64 chars: %q", lotCFID)
+	}
+	t.Logf("lot registered: %s", lotCFID[:12]+"…")
+
+	// Verify registration is live before retiring.
+	nameKey := LotNameKey(lotID)
+	resp, resolveErr := naming.Resolve(ctx, nsClient, nsCFID, nameKey)
+	if resolveErr != nil {
+		t.Fatalf("naming.Resolve before retire: %v", resolveErr)
+	}
+	if resp.CampfireID != lotCFID {
+		t.Errorf("naming.Resolve before retire: want %s, got %s", lotCFID[:12]+"…", resp.CampfireID[:12]+"…")
+	}
+	t.Logf("pre-retire Resolve: %q → %s ✓", nameKey, resp.CampfireID[:12]+"…")
+
+	// Call LotRetire — the function under test.
+	if retireErr := LotRetire(ctx, cfg); retireErr != nil {
+		t.Fatalf("LotRetire: %v", retireErr)
+	}
+	t.Logf("LotRetire: completed without error")
+
+	// naming.Resolve must now return "not found".
+	_, resolveErrAfter := naming.Resolve(ctx, nsClient, nsCFID, nameKey)
+	if resolveErrAfter == nil {
+		t.Errorf("naming.Resolve after LotRetire: expected error (name not found), got nil — unregister did not take effect")
+	} else {
+		t.Logf("naming.Resolve after LotRetire: error as expected: %v ✓", resolveErrAfter)
+	}
+
+	// naming.List must not include the retired lot.
+	regs, listErr := naming.List(ctx, nsClient, nsCFID)
+	if listErr != nil {
+		t.Fatalf("naming.List after LotRetire: %v", listErr)
+	}
+	for _, r := range regs {
+		if r.Name == nameKey {
+			t.Errorf("naming.List after LotRetire: key %q still present with campfire_id=%s", nameKey, r.CampfireID[:12]+"…")
+		}
+	}
+	t.Logf("naming.List after LotRetire: key %q not found in list ✓", nameKey)
 }
 
 // lotKeys returns the lot- keys from a name→campfire_id map for error messages.

@@ -280,6 +280,42 @@ func EnsureLotCF(ctx context.Context, cfg LotCFConfig) (campfireID string, err e
 	return campfireID, nil
 }
 
+// LotRetire removes the naming registration for lotID from the namespace campfire.
+// This should be called when a lot is retired (e.g. sold, demolished, or otherwise
+// removed from service) so that build-crew talents no longer discover it via
+// naming.Resolve or naming.List.
+//
+// The beacon file is NOT removed by LotRetire — beacon files are durable records
+// of campfire creation and are not cleaned up here. Only the naming registration
+// is unregistered.
+//
+// If NamespaceCFID is empty, LotRetire is a no-op (no registration was made at
+// creation time). Returns nil in that case.
+//
+// Error semantics: naming.Unregister failures are returned as errors (unlike
+// registerLotName which is non-fatal). The caller decides how to handle them.
+func LotRetire(ctx context.Context, cfg LotCFConfig) error {
+	if cfg.NamespaceCFID == "" {
+		log.Printf("lot-cf: LotRetire lot %d: NamespaceCFID empty — no naming registration to unregister", cfg.LotID)
+		return nil
+	}
+
+	nameKey := LotNameKey(cfg.LotID)
+
+	nsClient, _, initErr := protocol.Init(cfg.CfHome)
+	if initErr != nil {
+		return fmt.Errorf("LotRetire lot %d: protocol.Init(%s): %w", cfg.LotID, cfg.CfHome, initErr)
+	}
+	defer nsClient.Close()
+
+	if unregErr := naming.Unregister(ctx, nsClient, cfg.NamespaceCFID, nameKey); unregErr != nil {
+		return fmt.Errorf("LotRetire lot %d: naming.Unregister %q: %w", cfg.LotID, nameKey, unregErr)
+	}
+
+	log.Printf("lot-cf: lot %d unregistered %q from namespace %s", cfg.LotID, nameKey, shortID(cfg.NamespaceCFID))
+	return nil
+}
+
 // registerLotName publishes "lot-<lotID>" in the automata-island namespace campfire.
 // Non-fatal: a registration failure is logged but does not prevent the caller from
 // returning the campfire ID — the campfire itself is already created and the beacon
