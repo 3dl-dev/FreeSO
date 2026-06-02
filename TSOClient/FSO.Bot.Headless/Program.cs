@@ -189,6 +189,10 @@ public class Program
         {
             FSO.SimAntics.VMContext.InitVMConfig(false);
             FSO.Content.Content.Init(gameLocation, FSO.Content.ContentMode.SERVER);
+            // automataisland-c3b: Content.Init only wires AbstractTextureRef.ImageFetchFunction
+            // when device != null (Content.cs:106-125). Without this call, lazy CityMap /
+            // texture loads (e.g. probe-road → roadmap.bmp) NRE because GetImage() returns null.
+            BotImageLoader.WireImageFetch();
             Log($"content-init: ok ({gameLocation})");
         }
         catch (Exception e)

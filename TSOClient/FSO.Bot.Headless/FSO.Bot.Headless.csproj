@@ -13,6 +13,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- automataisland-c3b: BotImageLoader.SoftImageFetch needs ImageSharp to read BMP/PNG
+         without a GraphicsDevice (mirrors FSO.Server.Core/CoreImageLoader.cs). -->
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.11" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\FSO.Server.Clients\FSO.Server.Clients.csproj" />
     <ProjectReference Include="..\FSO.Server.Protocol\FSO.Server.Protocol.csproj" />
     <ProjectReference Include="..\FSO.Server.DataService\FSO.Common.DataService.csproj" />
